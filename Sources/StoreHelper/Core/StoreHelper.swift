@@ -48,6 +48,17 @@ public struct UnwrappedVerificationResult<T> {
 @available(iOS 15.0, macOS 12.0, *)
 public class StoreHelper: ObservableObject {
     
+    // MARK: - Experimental
+    public typealias EventPayload = (productId: ProductId, type: StoreNotification)
+    
+    public lazy var eventsStream: AsyncStream<EventPayload> = {
+        AsyncStream<EventPayload> { [weak self] continuation in
+            self?.eventsContinuation = continuation
+        }
+    }()
+    
+    private var eventsContinuation: AsyncStream<EventPayload>.Continuation?
+    
     // MARK: - Public properties
     
     /// Array of `Product` retrieved from the App Store and available for purchase.
@@ -425,7 +436,8 @@ public class StoreHelper: ObservableObject {
         // Start a purchase transaction
         purchaseState = .inProgress
         StoreLog.event(.purchaseInProgress, productId: product.id)
-
+        self.eventsContinuation?.yield((product.id, .purchaseInProgress))
+        
         let result: Product.PurchaseResult
         do {
             result = try await product.purchase(options: options)
@@ -454,6 +466,8 @@ public class StoreHelper: ObservableObject {
                 if !checkResult.verified {
                     purchaseState = .failedVerification
                     StoreLog.transaction(.transactionValidationFailure, productId: checkResult.transaction.productID)
+                    self.eventsContinuation?.yield((checkResult.transaction.productID, .transactionValidationFailure))
+                    
                     throw StoreException.transactionVerificationFailed
                 }
 
@@ -472,22 +486,26 @@ public class StoreHelper: ObservableObject {
                 // Let the caller know the purchase succeeded and that the user should be given access to the product
                 purchaseState = .purchased
                 StoreLog.event(.purchaseSuccess, productId: product.id)
+                eventsContinuation?.yield((product.id, .purchaseSuccess))
 
                 return (transaction: validatedTransaction, purchaseState: .purchased)
 
             case .userCancelled:
                 purchaseState = .cancelled
                 StoreLog.event(.purchaseCancelled, productId: product.id)
+                self.eventsContinuation?.yield((product.id, .purchaseCancelled))
                 return (transaction: nil, .cancelled)
 
             case .pending:
                 purchaseState = .pending
                 StoreLog.event(.purchasePending, productId: product.id)
+                self.eventsContinuation?.yield((product.id, .purchasePending))
                 return (transaction: nil, .pending)
 
             default:
                 purchaseState = .unknown
                 StoreLog.event(.purchaseFailure, productId: product.id)
+                self.eventsContinuation?.yield((product.id, .purchaseFailure))
                 return (transaction: nil, .unknown)
         }
     }
@@ -498,6 +516,8 @@ public class StoreHelper: ObservableObject {
     @MainActor public func productPurchased(_ productId: ProductId)  {
         updatePurchasedProducts(for: productId, purchased: true)
         purchaseState = .purchased
+        
+        eventsContinuation?.yield((productId, .productIsPurchased))
         StoreLog.event(.purchaseSuccess, productId: productId)
     }
     
@@ -701,12 +721,15 @@ public class StoreHelper: ObservableObject {
         
         return Task.detached {
             
-            for await verificationResult in Transaction.updates {
+            for await status in Product.SubscriptionInfo.Status.updates {
+                let verificationResult = status.transaction
+                
                 // See if StoreKit validated the transaction
                 let checkResult = await self.checkVerificationResult(result: verificationResult)
                 guard checkResult.verified else {
                     // StoreKit's attempts to validate the transaction failed
                     StoreLog.transaction(.transactionFailure, productId: checkResult.transaction.productID)
+                    self.eventsContinuation?.yield((checkResult.transaction.productID, .transactionFailure))
                     return
                 }
                 
@@ -719,6 +742,7 @@ public class StoreHelper: ObservableObject {
                     // See transaction.revocationReason for more details if required
                     StoreLog.transaction(.transactionRevoked, productId: transaction.productID)
                     await self.updatePurchasedProducts(for: transaction.productID, purchased: false)
+                    self.eventsContinuation?.yield((transaction.productID, .transactionRevoked))
                     return
                 }
                 
@@ -726,6 +750,7 @@ public class StoreHelper: ObservableObject {
                     // The user's subscription has expired
                     StoreLog.transaction(.transactionExpired, productId: transaction.productID)
                     await self.updatePurchasedProducts(for: transaction.productID, purchased: false)
+                    self.eventsContinuation?.yield((transaction.productID, .transactionExpired))
                     return
                 }
                 
@@ -733,12 +758,14 @@ public class StoreHelper: ObservableObject {
                     // Transaction superceeded by an active, higher-value subscription
                     StoreLog.transaction(.transactionUpgraded, productId: transaction.productID)
                     await self.updatePurchasedProducts(for: transaction.productID, purchased: false)
+                    self.eventsContinuation?.yield((transaction.productID, .transactionUpgraded))
                     return
                 }
                     
                 // Update the list of products the user has access to
                 StoreLog.transaction(.transactionSuccess, productId: transaction.productID)
                 await self.updatePurchasedProducts(transaction: transaction, purchased: true)
+                self.eventsContinuation?.yield((transaction.productID, .transactionSuccess))
                 await transaction.finish()
             }
         }
