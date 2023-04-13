@@ -289,14 +289,14 @@ public class StoreHelper: ObservableObject {
             updatePurchasedProducts(for: productId, purchased: purchased, updateFallbackList: false, updateTransactionCheck: false)
             return purchased
         }
-
+        
         // Make sure we're listening for transactions, the App Store is available, we have a list of localized products
         // and that we can create a `Product` from the `ProductId`. If not, we have to rely on the cache of purchased products
         guard hasStarted, isAppStoreAvailable, hasProducts, let product = product(from: productId) else {
             StoreLog.event(.appStoreNotAvailable)
             purchased = purchasedProductsFallback.contains(productId)
             StoreLog.event(purchased ? .productIsPurchasedFromCache : .productIsNotPurchased, productId: productId)
-            return purchasedProductsFallback.contains(productId)
+            return purchased
         }
 
         // Is this a consumable product? We need to treat consumables differently because their transactions are NOT stored in the receipt
@@ -312,6 +312,16 @@ public class StoreHelper: ObservableObject {
             // There's no transaction for the product, so it hasn't been purchased. However, the App Store does sometimes return nil,
             // even if the user is entitled to access the product. For this reason we don't update the fallback cache and transaction
             // check list for a negative response
+            
+            // If this is a subscription product, before giving up see if it was renewed while the app was offline and the
+            // transaction hasn't yet been sent to us
+            if product.type == .autoRenewable {
+                if purchasedProductsFallback.contains(productId) {
+                    StoreLog.event(.productIsPurchasedFromCache, productId: productId)
+                    return true
+                }
+            }
+            
             StoreLog.event(.productIsNotPurchasedNoEntitlement, productId: productId)
             return false
         }
@@ -319,7 +329,7 @@ public class StoreHelper: ObservableObject {
         // See if the transaction passed StoreKit's automatic verification
         let result = checkVerificationResult(result: currentEntitlement)
         if !result.verified {
-            StoreLog.transaction(.transactionValidationFailure, productId: result.transaction.productID)
+            StoreLog.transaction(.transactionValidationFailure, productId: result.transaction.productID, transactionId: String(result.transaction.id))
             throw StoreException.transactionVerificationFailed
         }
 
@@ -331,7 +341,7 @@ public class StoreHelper: ObservableObject {
             default:             throw StoreException.productTypeNotSupported
         }
         
-        StoreLog.event(purchased ? .productIsPurchasedFromTransaction : .productIsNotPurchased, productId: productId)
+        StoreLog.event(purchased ? .productIsPurchasedFromTransaction : .productIsNotPurchased, productId: productId, transactionId: String(result.transaction.id))
         updatePurchasedProducts(for: productId, purchased: purchased)
         return purchased
     }
@@ -465,9 +475,9 @@ public class StoreHelper: ObservableObject {
                 let checkResult = checkVerificationResult(result: verificationResult)
                 if !checkResult.verified {
                     purchaseState = .failedVerification
-                    StoreLog.transaction(.transactionValidationFailure, productId: checkResult.transaction.productID)
+
+                    StoreLog.transaction(.transactionValidationFailure, productId: checkResult.transaction.productID, transactionId: String(checkResult.transaction.id))
                     self.eventsContinuation?.yield((checkResult.transaction.productID, checkResult.transaction, .transactionValidationFailure))
-                    
                     throw StoreException.transactionVerificationFailed
                 }
 
@@ -485,7 +495,8 @@ public class StoreHelper: ObservableObject {
 
                 // Let the caller know the purchase succeeded and that the user should be given access to the product
                 purchaseState = .purchased
-                StoreLog.event(.purchaseSuccess, productId: product.id)
+
+                StoreLog.event(.purchaseSuccess, productId: product.id, transactionId: String(validatedTransaction.id))
                 eventsContinuation?.yield((product.id, validatedTransaction, .purchaseSuccess))
 
                 return (transaction: validatedTransaction, purchaseState: .purchased)
@@ -513,12 +524,12 @@ public class StoreHelper: ObservableObject {
     /// Should be called only when a purchase is handled by the StoreKit1-based AppHelper.
     /// This will be as a result of a user dirctly purchasing in IAP in the App Store ("IAP Promotion"), rather than in our app.
     /// - Parameter product: The ProductId of the purchased product.
-    @MainActor public func productPurchased(_ productId: ProductId)  {
+    @MainActor public func productPurchased(_ productId: ProductId, transactionId: String)  {
         updatePurchasedProducts(for: productId, purchased: true)
         purchaseState = .purchased
-        
+
         eventsContinuation?.yield((productId, nil, .productIsPurchased))
-        StoreLog.event(.purchaseSuccess, productId: productId)
+        StoreLog.event(.purchaseSuccess, productId: productId, transactionId: transactionId)
     }
     
     /// The `Product` associated with a `ProductId`.
@@ -691,6 +702,9 @@ public class StoreHelper: ObservableObject {
         // because the they don't purchase anything and are not considered to be part of the app that did the purchasing as far as
         // StoreKit is concerned.
         AppGroupSupport.syncPurchase(productId: productId, purchased: purchased)
+        
+        // Persist the fallback list of purchased products
+        savePurchasedProductsFallbackList()
     }
     
     /// Updates and persists our fallback cache of purchased products (`purchasedProductsFallback`). Also makes sure our set of purchase
@@ -730,19 +744,19 @@ public class StoreHelper: ObservableObject {
                 let checkResult = await self.checkVerificationResult(result: verificationResult)
                 guard checkResult.verified else {
                     // StoreKit's attempts to validate the transaction failed
-                    StoreLog.transaction(.transactionFailure, productId: checkResult.transaction.productID)
+                    StoreLog.transaction(.transactionFailure, productId: checkResult.transaction.productID, transactionId: String(checkResult.transaction.id))
                     self.eventsContinuation?.yield((checkResult.transaction.productID, nil, .transactionFailure))
                     return
                 }
                 
                 // The transaction was validated by StoreKit
                 let transaction = checkResult.transaction
-                StoreLog.transaction(.transactionReceived, productId: transaction.productID)
+                StoreLog.transaction(.transactionReceived, productId: transaction.productID, transactionId: String(transaction.id))
                     
                 if transaction.revocationDate != nil {
                     // The user's access to the product has been revoked by the App Store (e.g. a refund, etc.)
                     // See transaction.revocationReason for more details if required
-                    StoreLog.transaction(.transactionRevoked, productId: transaction.productID)
+                    StoreLog.transaction(.transactionRevoked, productId: transaction.productID, transactionId: String(transaction.id))
                     await self.updatePurchasedProducts(for: transaction.productID, purchased: false)
                     self.eventsContinuation?.yield((transaction.productID, transaction, .transactionRevoked))
                     return
@@ -750,7 +764,7 @@ public class StoreHelper: ObservableObject {
                 
                 if let expirationDate = transaction.expirationDate, expirationDate < Date() {
                     // The user's subscription has expired
-                    StoreLog.transaction(.transactionExpired, productId: transaction.productID)
+                    StoreLog.transaction(.transactionExpired, productId: transaction.productID, transactionId: String(transaction.id))
                     await self.updatePurchasedProducts(for: transaction.productID, purchased: false)
                     self.eventsContinuation?.yield((transaction.productID, transaction, .transactionExpired))
                     return
@@ -758,14 +772,14 @@ public class StoreHelper: ObservableObject {
                 
                 if transaction.isUpgraded {
                     // Transaction superceeded by an active, higher-value subscription
-                    StoreLog.transaction(.transactionUpgraded, productId: transaction.productID)
-                    await self.updatePurchasedProducts(for: transaction.productID, purchased: false)
+                    StoreLog.transaction(.transactionUpgraded, productId: transaction.productID, transactionId: String(transaction.id))
+                    await self.updatePurchasedProducts(for: transaction.productID, purchased: true)
                     self.eventsContinuation?.yield((transaction.productID, transaction, .transactionUpgraded))
                     return
                 }
                     
                 // Update the list of products the user has access to
-                StoreLog.transaction(.transactionSuccess, productId: transaction.productID)
+                StoreLog.transaction(.transactionSuccess, productId: transaction.productID, transactionId: String(transaction.id))
                 await self.updatePurchasedProducts(transaction: transaction, purchased: true)
                 self.eventsContinuation?.yield((transaction.productID, transaction, .transactionSuccess))
                 await transaction.finish()
